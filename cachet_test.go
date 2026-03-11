@@ -43,9 +43,10 @@ func TestBasicCacheHit(t *testing.T) {
 		t.Fatalf("unexpected result on cache hit: %+v", p2)
 	}
 
-	// First call = cache miss, second = cache hit. Both call unmarshal.
+	// First call = cache miss (unmarshals twice: once for caller, once for cache).
+	// Second call = cache hit (no unmarshal, value returned via reflect.Set).
 	if got := calls.Load(); got != 2 {
-		t.Fatalf("expected 2 unmarshal calls, got %d", got)
+		t.Fatalf("expected 2 unmarshal calls (miss only), got %d", got)
 	}
 }
 
@@ -151,6 +152,10 @@ func (c *trackingCache) Store(key, value any) {
 	c.inner.Store(key, value)
 }
 
+func (c *trackingCache) Clear() {
+	c.inner.Clear()
+}
+
 func TestInvalidJSON(t *testing.T) {
 	dec := New()
 	data := []byte(`{invalid}`)
@@ -213,6 +218,26 @@ func TestInputSliceMutationSafe(t *testing.T) {
 	}
 }
 
+func TestClear(t *testing.T) {
+	var calls atomic.Int64
+	dec := New(WithUnmarshalFunc(func(data []byte, v any) error {
+		calls.Add(1)
+		return json.Unmarshal(data, v)
+	}))
+
+	data := []byte(`{"name":"clear","age":1}`)
+
+	var p person
+	_ = dec.Unmarshal(data, &p) // miss: 2 unmarshal calls (caller + cache copy)
+
+	dec.Clear()
+
+	_ = dec.Unmarshal(data, &p) // miss again after clear: 2 more calls
+	if got := calls.Load(); got != 4 {
+		t.Fatalf("expected 4 unmarshal calls after clear, got %d", got)
+	}
+}
+
 // Benchmarks: worst case (all misses) vs stdlib json.Unmarshal.
 // cachet will always be slower on pure misses due to the string(data)
 // conversion, reflect.TypeOf, and sync.Map overhead. These benchmarks
@@ -237,15 +262,6 @@ func makeLargePayload() []byte {
 	}
 	b, _ := json.Marshal(items)
 	return b
-}
-
-type largeResult struct {
-	Items []struct {
-		ID     int    `json:"id"`
-		Name   string `json:"name"`
-		Email  string `json:"email"`
-		Active bool   `json:"active"`
-	}
 }
 
 func BenchmarkSmallPayload_StdlibOnly(b *testing.B) {
@@ -283,6 +299,7 @@ func BenchmarkLargePayload_StdlibOnly(b *testing.B) {
 
 func BenchmarkLargePayload_CachetAllMisses(b *testing.B) {
 	// Generate unique but valid payloads by varying the first item's ID.
+	// Must use b.N loop (not b.Loop()) because payloads are pre-generated.
 	type item struct {
 		ID     int    `json:"id"`
 		Name   string `json:"name"`
@@ -302,5 +319,39 @@ func BenchmarkLargePayload_CachetAllMisses(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		var r []item
 		_ = dec.Unmarshal(payloads[i], &r)
+	}
+}
+
+func BenchmarkSmallPayload_CachetAllHits(b *testing.B) {
+	dec := New()
+	// Prime the cache.
+	var p person
+	_ = dec.Unmarshal(smallPayload, &p)
+	b.ResetTimer()
+	for b.Loop() {
+		var p person
+		_ = dec.Unmarshal(smallPayload, &p)
+	}
+}
+
+func BenchmarkLargePayload_CachetAllHits(b *testing.B) {
+	dec := New()
+	// Prime the cache.
+	var r []struct {
+		ID     int    `json:"id"`
+		Name   string `json:"name"`
+		Email  string `json:"email"`
+		Active bool   `json:"active"`
+	}
+	_ = dec.Unmarshal(largePayload, &r)
+	b.ResetTimer()
+	for b.Loop() {
+		var r []struct {
+			ID     int    `json:"id"`
+			Name   string `json:"name"`
+			Email  string `json:"email"`
+			Active bool   `json:"active"`
+		}
+		_ = dec.Unmarshal(largePayload, &r)
 	}
 }
