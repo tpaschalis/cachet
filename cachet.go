@@ -1,8 +1,8 @@
 // Package cachet provides memoized JSON unmarshalling.
 //
-// It is a drop-in replacement for json.Unmarshal that caches results.
-// When the same JSON bytes are unmarshalled to the same target type,
-// the cached bytes are used instead of re-parsing from scratch.
+// It wraps any json.Unmarshal-compatible function and caches the
+// unmarshalled Go values. On a cache hit the stored value is copied
+// into the caller's target via reflect.Set — no JSON parsing happens.
 //
 // Basic usage with the package-level function:
 //
@@ -17,14 +17,9 @@
 //	)
 //	err := dec.Unmarshal(data, &v)
 //
-// TODO: Consider adding a generic API to avoid unmarshal on cache hit entirely:
-//
-//	func Get[T any](d *Decoder, data []byte) (T, error)
-//
-// A generic version could store the unmarshalled Go value directly and return
-// it by value on cache hit — a true zero-cost hit for plain structs. This would
-// require Go 1.18+ and a different API shape, but could be offered alongside
-// the traditional Unmarshal for users who want maximum performance.
+// Cache hits return a shallow copy. If the target type contains slices,
+// maps, or pointer fields, treat the returned value as read-only or
+// copy those fields before mutating.
 package cachet
 
 import (
@@ -40,10 +35,11 @@ import (
 type UnmarshalFunc func(data []byte, v any) error
 
 // Cache is the interface for pluggable cache storage backends.
-// *sync.Map satisfies this interface with no wrapper needed.
+// *sync.Map satisfies this interface out of the box.
 type Cache interface {
 	Load(key any) (value any, ok bool)
 	Store(key, value any)
+	Clear()
 }
 
 // cacheKey is used as the map key. Both fields are comparable,
@@ -92,37 +88,50 @@ func New(opts ...Option) *Decoder {
 
 // Unmarshal decodes JSON data into v, using the cache when possible.
 // v must be a non-nil pointer, as with encoding/json.Unmarshal.
+//
+// On a cache hit the stored Go value is copied into v via reflect.Set.
+// No JSON parsing occurs. The copy is shallow: if the target type
+// contains slices, maps, or pointer fields, the caller shares the
+// underlying data with the cache. Treat such fields as read-only or
+// copy them before mutating.
 func (d *Decoder) Unmarshal(data []byte, v any) error {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
 		return errors.New("cachet: v must be a non-nil pointer")
 	}
 
-	// TODO: Allow users to provide a custom KeyFunc(data []byte, typ reflect.Type) any
-	// to avoid the string(data) conversion. For example, users with large payloads
-	// could supply an xxhash or SHA256-based key function that hashes the bytes
-	// instead of copying them into a string, trading CPU for memory.
 	key := cacheKey{
 		data: string(data),
 		typ:  rv.Type().Elem(),
 	}
 
-	// Cache hit: unmarshal from the stored bytes.
+	// Cache hit: copy the stored value into the caller's target.
 	if cached, ok := d.cache.Load(key); ok {
-		return d.unmarshal(cached.([]byte), v)
+		rv.Elem().Set(reflect.ValueOf(cached))
+		return nil
 	}
 
-	// Cache miss: unmarshal the original data.
+	// Cache miss: unmarshal into the caller's target.
 	if err := d.unmarshal(data, v); err != nil {
 		return err
 	}
 
-	// Store a copy of the input bytes so the caller can't mutate them.
-	stored := make([]byte, len(data))
-	copy(stored, data)
-	d.cache.Store(key, stored)
+	// Store an independent copy so caller mutations don't corrupt
+	// the cache. We unmarshal a second time into a fresh value.
+	cp := reflect.New(key.typ)
+	if err := d.unmarshal(data, cp.Interface()); err != nil {
+		// The first unmarshal succeeded, so this shouldn't fail.
+		// If it does, we skip caching but still return the result.
+		return nil
+	}
+	d.cache.Store(key, cp.Elem().Interface())
 
 	return nil
+}
+
+// Clear removes all entries from the cache.
+func (d *Decoder) Clear() {
+	d.cache.Clear()
 }
 
 // defaultDecoder is used by the package-level Unmarshal function.
