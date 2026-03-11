@@ -98,6 +98,10 @@ func (d *Decoder) Unmarshal(data []byte, v any) error {
 		return errors.New("cachet: v must be a non-nil pointer")
 	}
 
+	// TODO: Allow users to provide a custom KeyFunc(data []byte, typ reflect.Type) any
+	// to avoid the string(data) conversion. For example, users with large payloads
+	// could supply an xxhash or SHA256-based key function that hashes the bytes
+	// instead of copying them into a string, trading CPU for memory.
 	key := cacheKey{
 		data: string(data),
 		typ:  rv.Type().Elem(),

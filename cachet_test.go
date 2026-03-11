@@ -2,6 +2,7 @@ package cachet
 
 import (
 	"encoding/json"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -209,5 +210,97 @@ func TestInputSliceMutationSafe(t *testing.T) {
 	}
 	if p2.Name != "safe" || p2.Age != 1 {
 		t.Fatalf("cached bytes were corrupted: %+v", p2)
+	}
+}
+
+// Benchmarks: worst case (all misses) vs stdlib json.Unmarshal.
+// cachet will always be slower on pure misses due to the string(data)
+// conversion, reflect.TypeOf, and sync.Map overhead. These benchmarks
+// quantify exactly how much.
+
+// smallPayload is a typical small JSON object.
+var smallPayload = []byte(`{"name":"alice","age":30}`)
+
+// largePayload simulates a more realistic API response.
+var largePayload = makeLargePayload()
+
+func makeLargePayload() []byte {
+	type item struct {
+		ID     int    `json:"id"`
+		Name   string `json:"name"`
+		Email  string `json:"email"`
+		Active bool   `json:"active"`
+	}
+	items := make([]item, 100)
+	for i := range items {
+		items[i] = item{ID: i, Name: "user", Email: "user@example.com", Active: true}
+	}
+	b, _ := json.Marshal(items)
+	return b
+}
+
+type largeResult struct {
+	Items []struct {
+		ID     int    `json:"id"`
+		Name   string `json:"name"`
+		Email  string `json:"email"`
+		Active bool   `json:"active"`
+	}
+}
+
+func BenchmarkSmallPayload_StdlibOnly(b *testing.B) {
+	for b.Loop() {
+		var p person
+		_ = json.Unmarshal(smallPayload, &p)
+	}
+}
+
+func BenchmarkSmallPayload_CachetAllMisses(b *testing.B) {
+	// Every iteration uses a unique payload to guarantee all misses.
+	payloads := make([][]byte, b.N)
+	for i := range payloads {
+		payloads[i] = []byte(`{"name":"user` + strconv.Itoa(i) + `","age":` + strconv.Itoa(i) + `}`)
+	}
+	dec := New()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var p person
+		_ = dec.Unmarshal(payloads[i], &p)
+	}
+}
+
+func BenchmarkLargePayload_StdlibOnly(b *testing.B) {
+	for b.Loop() {
+		var r []struct {
+			ID     int    `json:"id"`
+			Name   string `json:"name"`
+			Email  string `json:"email"`
+			Active bool   `json:"active"`
+		}
+		_ = json.Unmarshal(largePayload, &r)
+	}
+}
+
+func BenchmarkLargePayload_CachetAllMisses(b *testing.B) {
+	// Generate unique but valid payloads by varying the first item's ID.
+	type item struct {
+		ID     int    `json:"id"`
+		Name   string `json:"name"`
+		Email  string `json:"email"`
+		Active bool   `json:"active"`
+	}
+	payloads := make([][]byte, b.N)
+	for i := range payloads {
+		items := make([]item, 100)
+		for j := range items {
+			items[j] = item{ID: i*100 + j, Name: "user", Email: "user@example.com", Active: true}
+		}
+		payloads[i], _ = json.Marshal(items)
+	}
+	dec := New()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var r []item
+		_ = dec.Unmarshal(payloads[i], &r)
 	}
 }
