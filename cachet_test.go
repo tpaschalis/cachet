@@ -3,6 +3,7 @@ package cachet
 import (
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -44,10 +45,10 @@ func TestBasicCacheHit(t *testing.T) {
 		t.Fatalf("unexpected result on cache hit: %+v", p2)
 	}
 
-	// First call = cache miss (unmarshals twice: once for caller, once for cache).
-	// Second call = cache hit (no unmarshal, value returned via reflect.Set).
-	if got := calls.Load(); got != 2 {
-		t.Fatalf("expected 2 unmarshal calls (miss only), got %d", got)
+	// person has only value-typed fields, so the cache miss stores via
+	// reflect.Set (1 unmarshal). The hit uses reflect.Set (0 unmarshals).
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected 1 unmarshal call (value-type fast path), got %d", got)
 	}
 }
 
@@ -244,6 +245,77 @@ func TestSliceFieldMutationSafe(t *testing.T) {
 	}
 }
 
+func TestHasReferenceFields(t *testing.T) {
+	tests := []struct {
+		name string
+		typ  reflect.Type
+		want bool
+	}{
+		{"string", reflect.TypeOf(""), false},
+		{"int", reflect.TypeOf(0), false},
+		{"bool", reflect.TypeOf(true), false},
+		{"flat struct", reflect.TypeOf(person{}), false},
+		{"struct with slice", reflect.TypeOf(struct{ Tags []string }{}), true},
+		{"struct with map", reflect.TypeOf(struct{ M map[string]int }{}), true},
+		{"struct with pointer", reflect.TypeOf(struct{ P *int }{}), true},
+		{"struct with interface", reflect.TypeOf(struct{ V any }{}), true},
+		{"nested flat struct", reflect.TypeOf(struct{ P person }{}), false},
+		{"nested ref struct", reflect.TypeOf(struct {
+			Inner struct{ Tags []string }
+		}{}), true},
+		{"array of values", reflect.TypeOf([3]int{}), false},
+		{"array of slices", reflect.TypeOf([2][]string{}), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasReferenceFields(tt.typ); got != tt.want {
+				t.Errorf("hasReferenceFields(%v) = %v, want %v", tt.typ, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValueTypeFastPath(t *testing.T) {
+	// person is purely value-typed: miss should unmarshal once (no second copy).
+	var calls atomic.Int64
+	dec := New(WithUnmarshalFunc(func(data []byte, v any) error {
+		calls.Add(1)
+		return json.Unmarshal(data, v)
+	}))
+
+	data := []byte(`{"name":"fast","age":1}`)
+	var p person
+	_ = dec.Unmarshal(data, &p) // miss
+	_ = dec.Unmarshal(data, &p) // hit
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("value-type: expected 1 unmarshal call, got %d", got)
+	}
+}
+
+func TestReferenceTypeSlowPath(t *testing.T) {
+	// tagged has a []string field: miss should unmarshal twice (caller + cache copy).
+	type tagged struct {
+		Name string   `json:"name"`
+		Tags []string `json:"tags"`
+	}
+
+	var calls atomic.Int64
+	dec := New(WithUnmarshalFunc(func(data []byte, v any) error {
+		calls.Add(1)
+		return json.Unmarshal(data, v)
+	}))
+
+	data := []byte(`{"name":"slow","tags":["a"]}`)
+	var v tagged
+	_ = dec.Unmarshal(data, &v) // miss: 2 unmarshals
+	_ = dec.Unmarshal(data, &v) // hit: 0 unmarshals
+
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("reference-type: expected 2 unmarshal calls, got %d", got)
+	}
+}
+
 func TestNilPointerError(t *testing.T) {
 	dec := New()
 	err := dec.Unmarshal([]byte(`{}`), (*person)(nil))
@@ -286,13 +358,13 @@ func TestClear(t *testing.T) {
 	data := []byte(`{"name":"clear","age":1}`)
 
 	var p person
-	_ = dec.Unmarshal(data, &p) // miss: 2 unmarshal calls (caller + cache copy)
+	_ = dec.Unmarshal(data, &p) // miss: 1 unmarshal (value-type fast path)
 
 	dec.Clear()
 
-	_ = dec.Unmarshal(data, &p) // miss again after clear: 2 more calls
-	if got := calls.Load(); got != 4 {
-		t.Fatalf("expected 4 unmarshal calls after clear, got %d", got)
+	_ = dec.Unmarshal(data, &p) // miss again after clear: 1 more call
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("expected 2 unmarshal calls after clear, got %d", got)
 	}
 }
 
