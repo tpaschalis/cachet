@@ -1,10 +1,6 @@
 # cachet
 
-Memoized JSON unmarshalling for Go. Drop-in replacement for `json.Unmarshal`
-that caches the unmarshalled Go value so repeated calls with the same payload
-skip JSON parsing entirely.
-
-## Install
+Memoized `json.Unmarshal` for Go. Same signature, cached results.
 
 ```
 go get github.com/tpaschalis/cachet
@@ -12,29 +8,26 @@ go get github.com/tpaschalis/cachet
 
 ## Usage
 
-Use it exactly like `json.Unmarshal`:
-
 ```go
 var v MyStruct
-err := cachet.Unmarshal(data, &v)
+err := cachet.Unmarshal(data, &v) // parses JSON
+err  = cachet.Unmarshal(data, &v) // copies from cache
 ```
 
-Or configure your own decoder with a custom cache backend or JSON library:
+Custom decoder with your own cache or JSON library:
 
 ```go
 dec := cachet.New(
     cachet.WithCache(myLRUCache),             // default: *sync.Map
     cachet.WithUnmarshalFunc(sonic.Unmarshal), // default: encoding/json
 )
-err := dec.Unmarshal(data, &v)
 ```
 
-Call `dec.Clear()` to flush the cache when you need to.
+`dec.Clear()` flushes the cache.
 
 ### Cache interface
 
-Any type that implements `Load`, `Store`, and `Clear` works as a backend.
-`*sync.Map` satisfies this out of the box.
+Anything with `Load`, `Store`, and `Clear`. `*sync.Map` works out of the box.
 
 ```go
 type Cache interface {
@@ -46,38 +39,33 @@ type Cache interface {
 
 ## How it works
 
-The cache key is `(string(jsonBytes), reflect.Type)`. On a miss, the data
-is unmarshalled into the caller's value and a second unmarshal produces an
-independent copy for the cache. On a hit, the stored Go value is copied
-into the caller's target via `reflect.Set` -- no JSON parsing happens.
+Cache key is `(string(jsonBytes), reflect.Type)`.
 
-Cache hits return a shallow copy. For structs with only value-type fields
-(int, string, bool, etc.) this is safe. If your type contains slices, maps,
-or pointer fields, treat the returned value as read-only or copy those
-fields before mutating.
+- **Miss**: unmarshal into caller's value, store an independent copy.
+  Value-only types (int, string, bool, flat structs) copy for free;
+  types with slices/maps/pointers need a second unmarshal.
+- **Hit**: `reflect.Set` the stored value into the caller — no parsing.
+- **Errors**: cached too. Repeated bad payloads return the stored error
+  without re-parsing.
+
+Hits are shallow copies. Types with reference fields share underlying
+data with the cache — treat as read-only or copy before mutating.
 
 ## Benchmarks
 
-10 runs each, `encoding/json` as the baseline.
-
 ```
-goos: linux
-goarch: amd64
-
                      encoding/json     cachet hit     cachet miss
 SmallPayload          620 ns/op        127 ns/op       2247 ns/op
 LargePayload        82915 ns/op       2047 ns/op     109813 ns/op
 ```
 
-Cache hits are ~5x faster on small payloads and ~40x faster on large
-payloads. The miss overhead comes from the second unmarshal (to create
-the cached copy), `string(data)` key conversion, and `sync.Map` bookkeeping.
+Hits: ~5x faster (small), ~40x faster (large). Miss overhead is the
+second unmarshal + `string(data)` conversion + `sync.Map` bookkeeping.
 
 ## Trade-offs
 
-The default `sync.Map` cache grows without bound. For workloads with
-many unique payloads, use `WithCache` to plug in an LRU or size-bounded
-backend and call `Clear` as needed.
+The default `sync.Map` grows without bound. For many-unique-payload
+workloads, plug in an LRU via `WithCache`.
 
 ## License
 
