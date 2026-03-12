@@ -159,7 +159,12 @@ func (c *trackingCache) Clear() {
 }
 
 func TestInvalidJSON(t *testing.T) {
-	dec := New()
+	var calls atomic.Int64
+	dec := New(WithUnmarshalFunc(func(data []byte, v any) error {
+		calls.Add(1)
+		return json.Unmarshal(data, v)
+	}))
+
 	data := []byte(`{invalid}`)
 
 	var p person
@@ -168,11 +173,36 @@ func TestInvalidJSON(t *testing.T) {
 		t.Fatal("expected error for invalid JSON")
 	}
 
-	// Should not be cached — second call should also fail.
+	// Second call should return the cached error without calling unmarshal again.
 	var p2 person
 	err = dec.Unmarshal(data, &p2)
 	if err == nil {
 		t.Fatal("expected error on second call with invalid JSON")
+	}
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("expected 1 unmarshal call (error should be cached), got %d", got)
+	}
+}
+
+func TestCachedErrorDoesNotPolluteValue(t *testing.T) {
+	dec := New()
+
+	bad := []byte(`{invalid}`)
+	good := []byte(`{"name":"ok","age":1}`)
+
+	// Cache an error for bad data.
+	var p person
+	if err := dec.Unmarshal(bad, &p); err == nil {
+		t.Fatal("expected error")
+	}
+
+	// Good data with the same target type should work independently.
+	if err := dec.Unmarshal(good, &p); err != nil {
+		t.Fatalf("good data failed: %v", err)
+	}
+	if p.Name != "ok" || p.Age != 1 {
+		t.Fatalf("unexpected: %+v", p)
 	}
 }
 

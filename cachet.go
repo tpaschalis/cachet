@@ -87,6 +87,13 @@ func computeHasReferenceFields(t reflect.Type) bool {
 	}
 }
 
+// cacheEntry wraps a cached result. On success val holds the Go value
+// and err is nil. On failure err holds the unmarshal error and val is nil.
+type cacheEntry struct {
+	val any
+	err error
+}
+
 // Decoder is a memoized JSON decoder.
 type Decoder struct {
 	cache     Cache
@@ -143,14 +150,19 @@ func (d *Decoder) Unmarshal(data []byte, v any) error {
 		typ:  rv.Type().Elem(),
 	}
 
-	// Cache hit: copy the stored value into the caller's target.
+	// Cache hit: return the stored error or copy the stored value.
 	if cached, ok := d.cache.Load(key); ok {
-		rv.Elem().Set(reflect.ValueOf(cached))
+		entry := cached.(cacheEntry)
+		if entry.err != nil {
+			return entry.err
+		}
+		rv.Elem().Set(reflect.ValueOf(entry.val))
 		return nil
 	}
 
 	// Cache miss: unmarshal into the caller's target.
 	if err := d.unmarshal(data, v); err != nil {
+		d.cache.Store(key, cacheEntry{err: err})
 		return err
 	}
 
@@ -169,9 +181,9 @@ func (d *Decoder) Unmarshal(data []byte, v any) error {
 		if err := d.unmarshal(data, cp.Interface()); err != nil {
 			return nil
 		}
-		d.cache.Store(key, cp.Elem().Interface())
+		d.cache.Store(key, cacheEntry{val: cp.Elem().Interface()})
 	} else {
-		d.cache.Store(key, rv.Elem().Interface())
+		d.cache.Store(key, cacheEntry{val: rv.Elem().Interface()})
 	}
 
 	return nil
