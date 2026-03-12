@@ -48,6 +48,45 @@ type cacheKey struct {
 	typ  reflect.Type // target type (not the pointer type)
 }
 
+// hasReferenceFields reports whether t (or any nested struct field)
+// contains a slice, map, pointer, interface, channel, or func.
+// For such types a shallow reflect.Set shares underlying data between
+// the source and destination, so an independent copy requires a second
+// unmarshal. For purely value-typed structs (int, string, bool, arrays
+// of value types, etc.) reflect.Set is already a deep copy.
+//
+// Results are cached in a sync.Map so the recursive walk happens at
+// most once per type.
+var refFieldCache sync.Map // reflect.Type → bool
+
+func hasReferenceFields(t reflect.Type) bool {
+	if v, ok := refFieldCache.Load(t); ok {
+		return v.(bool)
+	}
+	result := computeHasReferenceFields(t)
+	refFieldCache.Store(t, result)
+	return result
+}
+
+func computeHasReferenceFields(t reflect.Type) bool {
+	switch t.Kind() {
+	case reflect.Slice, reflect.Map, reflect.Pointer,
+		reflect.Interface, reflect.Chan, reflect.Func:
+		return true
+	case reflect.Array:
+		return hasReferenceFields(t.Elem())
+	case reflect.Struct:
+		for i := range t.NumField() {
+			if hasReferenceFields(t.Field(i).Type) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
 // Decoder is a memoized JSON decoder.
 type Decoder struct {
 	cache     Cache
@@ -116,14 +155,24 @@ func (d *Decoder) Unmarshal(data []byte, v any) error {
 	}
 
 	// Store an independent copy so caller mutations don't corrupt
-	// the cache. We unmarshal a second time into a fresh value.
-	cp := reflect.New(key.typ)
-	if err := d.unmarshal(data, cp.Interface()); err != nil {
-		// The first unmarshal succeeded, so this shouldn't fail.
-		// If it does, we skip caching but still return the result.
-		return nil
+	// the cache.
+	//
+	// For types with only value-typed fields (int, string, bool, etc.)
+	// reflect.Set is already a full copy — no data is shared. We skip
+	// the second unmarshal entirely.
+	//
+	// For types with reference fields (slices, maps, pointers, etc.)
+	// reflect.Set would share underlying data, so we unmarshal a second
+	// time into a fresh value to get independent allocations.
+	if hasReferenceFields(key.typ) {
+		cp := reflect.New(key.typ)
+		if err := d.unmarshal(data, cp.Interface()); err != nil {
+			return nil
+		}
+		d.cache.Store(key, cp.Elem().Interface())
+	} else {
+		d.cache.Store(key, rv.Elem().Interface())
 	}
-	d.cache.Store(key, cp.Elem().Interface())
 
 	return nil
 }
