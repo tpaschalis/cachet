@@ -2,6 +2,7 @@ package cachet
 
 import (
 	"encoding/json"
+	"errors"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -174,14 +175,6 @@ func TestInvalidJSON(t *testing.T) {
 	}
 }
 
-func TestNilPointer(t *testing.T) {
-	dec := New()
-	err := dec.Unmarshal([]byte(`{}`), (*person)(nil))
-	if err == nil {
-		t.Fatal("expected error for nil pointer")
-	}
-}
-
 func TestPackageLevelUnmarshal(t *testing.T) {
 	data := []byte(`{"name":"global","age":42}`)
 	var p person
@@ -215,6 +208,71 @@ func TestInputSliceMutationSafe(t *testing.T) {
 	}
 	if p2.Name != "safe" || p2.Age != 1 {
 		t.Fatalf("cached bytes were corrupted: %+v", p2)
+	}
+}
+
+// TestSliceFieldMutationSafe proves the second unmarshal (to create the
+// cached copy) is necessary. A shallow reflect.Set would share the slice's
+// backing array between the caller and the cache. Mutating an element in
+// the caller's slice would then silently corrupt the cached value. The
+// second unmarshal gives the cache its own independent allocations.
+func TestSliceFieldMutationSafe(t *testing.T) {
+	type tagged struct {
+		Name string   `json:"name"`
+		Tags []string `json:"tags"`
+	}
+
+	dec := New()
+	data := []byte(`{"name":"x","tags":["a","b","c"]}`)
+
+	var v1 tagged
+	if err := dec.Unmarshal(data, &v1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Mutate a slice element in-place (not append — this modifies the
+	// backing array that a shallow copy would share with the cache).
+	v1.Tags[0] = "CORRUPTED"
+
+	// A second unmarshal should return the original tags from the cache.
+	var v2 tagged
+	if err := dec.Unmarshal(data, &v2); err != nil {
+		t.Fatal(err)
+	}
+	if v2.Tags[0] != "a" || v2.Tags[1] != "b" || v2.Tags[2] != "c" {
+		t.Fatalf("cache was corrupted by caller mutation: tags = %v", v2.Tags)
+	}
+}
+
+func TestNilPointerError(t *testing.T) {
+	dec := New()
+	err := dec.Unmarshal([]byte(`{}`), (*person)(nil))
+
+	var target *json.InvalidUnmarshalError
+	if !errors.As(err, &target) {
+		t.Fatalf("expected *json.InvalidUnmarshalError, got %T: %v", err, err)
+	}
+
+	// Verify message matches stdlib.
+	stdlibErr := json.Unmarshal([]byte(`{}`), (*person)(nil))
+	if err.Error() != stdlibErr.Error() {
+		t.Fatalf("error message mismatch:\n  cachet: %s\n  stdlib: %s", err, stdlibErr)
+	}
+}
+
+func TestNonPointerError(t *testing.T) {
+	dec := New()
+	err := dec.Unmarshal([]byte(`{}`), person{})
+
+	var target *json.InvalidUnmarshalError
+	if !errors.As(err, &target) {
+		t.Fatalf("expected *json.InvalidUnmarshalError, got %T: %v", err, err)
+	}
+
+	// Verify message matches stdlib.
+	stdlibErr := json.Unmarshal([]byte(`{}`), person{})
+	if err.Error() != stdlibErr.Error() {
+		t.Fatalf("error message mismatch:\n  cachet: %s\n  stdlib: %s", err, stdlibErr)
 	}
 }
 

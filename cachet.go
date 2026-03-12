@@ -24,7 +24,6 @@ package cachet
 
 import (
 	"encoding/json"
-	"errors"
 	"reflect"
 	"sync"
 )
@@ -97,7 +96,7 @@ func New(opts ...Option) *Decoder {
 func (d *Decoder) Unmarshal(data []byte, v any) error {
 	rv := reflect.ValueOf(v)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
-		return errors.New("cachet: v must be a non-nil pointer")
+		return &json.InvalidUnmarshalError{Type: reflect.TypeOf(v)}
 	}
 
 	key := cacheKey{
