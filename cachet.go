@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"reflect"
 	"sync"
+	"unsafe"
 )
 
 // UnmarshalFunc matches the signature of json.Unmarshal (and sonic, go-json, etc.).
@@ -33,9 +34,21 @@ type cacheKey struct {
 	typ  reflect.Type // target type (not the pointer type)
 }
 
+// unsafeString returns a string that shares b's backing array.
+// The result is only valid while b is alive and unmodified.
+//
+// NOTE: the returned string MUST only be used for cache lookups
+// (sync.Map.Load) — it must never be stored. The default *sync.Map
+// does not retain the lookup key. Custom Cache implementations
+// MUST NOT retain the key passed to Load; doing so creates a
+// dangling pointer once the caller's data slice is reused or collected.
+func unsafeString(b []byte) string {
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
 // hasReferenceFields reports whether t contains a slice, map, pointer,
-// interface, chan, or func (directly or in nested struct fields).
-// When true, caching requires a second unmarshal to get an independent copy.
+// interface, chan, or func in its exported, JSON-reachable fields.
+// When true, caching requires a deep copy to get an independent value.
 // Results are memoized per type.
 var refFieldCache sync.Map // reflect.Type → bool
 
@@ -56,8 +69,18 @@ func computeHasReferenceFields(t reflect.Type) bool {
 	case reflect.Array:
 		return hasReferenceFields(t.Elem())
 	case reflect.Struct:
+		// Only check exported fields: encoding/json never writes to
+		// unexported fields, so they can't cause shared-state issues.
+		// We also skip fields with `json:"-"` tags.
 		for i := range t.NumField() {
-			if hasReferenceFields(t.Field(i).Type) {
+			f := t.Field(i)
+			if !f.IsExported() {
+				continue
+			}
+			if tag := f.Tag.Get("json"); tag == "-" {
+				continue
+			}
+			if hasReferenceFields(f.Type) {
 				return true
 			}
 		}
@@ -67,9 +90,80 @@ func computeHasReferenceFields(t reflect.Type) bool {
 	}
 }
 
+// hasLiveRefs reports whether v contains any non-nil pointer, non-nil
+// interface, non-empty slice, or non-empty map. When false, a shallow
+// copy (reflect.Set) of v is already an independent value — no deep
+// copy is needed even if the type has reference-typed fields.
+func hasLiveRefs(v reflect.Value) bool {
+	switch v.Kind() {
+	case reflect.Pointer, reflect.Interface:
+		return !v.IsNil()
+	case reflect.Slice, reflect.Map:
+		return v.Len() > 0
+	case reflect.Struct:
+		for i := range v.NumField() {
+			if hasLiveRefs(v.Field(i)) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// deepCopyValue returns an independent deep copy of v. Slices, maps,
+// pointers, and interfaces are recursively copied so the result shares
+// no mutable state with the original. Scalars and strings are returned
+// as-is (they are already copied by value).
+func deepCopyValue(v reflect.Value) reflect.Value {
+	switch v.Kind() {
+	case reflect.Slice:
+		if v.IsNil() {
+			return reflect.Zero(v.Type())
+		}
+		cp := reflect.MakeSlice(v.Type(), v.Len(), v.Len())
+		for i := range v.Len() {
+			cp.Index(i).Set(deepCopyValue(v.Index(i)))
+		}
+		return cp
+	case reflect.Map:
+		if v.IsNil() {
+			return reflect.Zero(v.Type())
+		}
+		cp := reflect.MakeMapWithSize(v.Type(), v.Len())
+		iter := v.MapRange()
+		for iter.Next() {
+			cp.SetMapIndex(deepCopyValue(iter.Key()), deepCopyValue(iter.Value()))
+		}
+		return cp
+	case reflect.Pointer:
+		if v.IsNil() {
+			return reflect.Zero(v.Type())
+		}
+		cp := reflect.New(v.Type().Elem())
+		cp.Elem().Set(deepCopyValue(v.Elem()))
+		return cp
+	case reflect.Interface:
+		if v.IsNil() {
+			return reflect.Zero(v.Type())
+		}
+		// Dynamic value may be map[string]any, []any, etc.
+		inner := deepCopyValue(v.Elem())
+		return inner
+	case reflect.Struct:
+		cp := reflect.New(v.Type()).Elem()
+		for i := range v.NumField() {
+			cp.Field(i).Set(deepCopyValue(v.Field(i)))
+		}
+		return cp
+	default:
+		// Scalars, strings: already copied by value.
+		return v
+	}
+}
+
 // cacheEntry holds either a successful value or an error.
 type cacheEntry struct {
-	val any
+	val reflect.Value
 	err error
 }
 
@@ -117,8 +211,10 @@ func (d *Decoder) Unmarshal(data []byte, v any) error {
 		return &json.InvalidUnmarshalError{Type: reflect.TypeOf(v)}
 	}
 
+	// Build a lookup key using a zero-copy transient string.
+	// This avoids a []byte→string allocation on cache hits.
 	key := cacheKey{
-		data: string(data),
+		data: unsafeString(data),
 		typ:  rv.Type().Elem(),
 	}
 
@@ -128,26 +224,35 @@ func (d *Decoder) Unmarshal(data []byte, v any) error {
 		if entry.err != nil {
 			return entry.err
 		}
-		rv.Elem().Set(reflect.ValueOf(entry.val))
+		rv.Elem().Set(entry.val)
 		return nil
 	}
 
-	// Cache miss: unmarshal into the caller's target.
+	// Cache miss: allocate an owned string copy for storage,
+	// then unmarshal into the caller's target.
+	key.data = string(data)
+
 	if err := d.unmarshal(data, v); err != nil {
 		d.cache.Store(key, cacheEntry{err: err})
 		return err
 	}
 
-	// Store an independent copy. Value-only types copy for free via
-	// reflect.Set; reference types need a second unmarshal.
+	// Store an independent copy for the cache.
+	// We must snapshot via Interface() to detach from the caller's variable;
+	// a bare rv.Elem() is an addressable reflect.Value that aliases the
+	// caller's memory and would be mutated if they change their variable.
 	if hasReferenceFields(key.typ) {
-		cp := reflect.New(key.typ)
-		if err := d.unmarshal(data, cp.Interface()); err != nil {
-			return nil
+		if hasLiveRefs(rv.Elem()) {
+			// Reference fields are populated: deep-copy to avoid sharing
+			// backing arrays/maps/pointers with the caller's value.
+			cached := deepCopyValue(rv.Elem())
+			d.cache.Store(key, cacheEntry{val: cached})
+		} else {
+			// All reference fields are nil/empty: shallow copy is safe.
+			d.cache.Store(key, cacheEntry{val: reflect.ValueOf(rv.Elem().Interface())})
 		}
-		d.cache.Store(key, cacheEntry{val: cp.Elem().Interface()})
 	} else {
-		d.cache.Store(key, cacheEntry{val: rv.Elem().Interface()})
+		d.cache.Store(key, cacheEntry{val: reflect.ValueOf(rv.Elem().Interface())})
 	}
 
 	return nil

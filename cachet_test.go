@@ -323,8 +323,9 @@ func TestValueTypeFastPath(t *testing.T) {
 	}
 }
 
-func TestReferenceTypeSlowPath(t *testing.T) {
-	// tagged has a []string field: miss should unmarshal twice (caller + cache copy).
+func TestReferenceTypeDeepCopyPath(t *testing.T) {
+	// tagged has a []string field: miss should unmarshal once and deep-copy
+	// (no second unmarshal).
 	type tagged struct {
 		Name string   `json:"name"`
 		Tags []string `json:"tags"`
@@ -338,11 +339,11 @@ func TestReferenceTypeSlowPath(t *testing.T) {
 
 	data := []byte(`{"name":"slow","tags":["a"]}`)
 	var v tagged
-	_ = dec.Unmarshal(data, &v) // miss: 2 unmarshals
+	_ = dec.Unmarshal(data, &v) // miss: 1 unmarshal + deep copy
 	_ = dec.Unmarshal(data, &v) // hit: 0 unmarshals
 
-	if got := calls.Load(); got != 2 {
-		t.Fatalf("reference-type: expected 2 unmarshal calls, got %d", got)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("reference-type: expected 1 unmarshal call (deep copy path), got %d", got)
 	}
 }
 
@@ -398,10 +399,134 @@ func TestClear(t *testing.T) {
 	}
 }
 
+func TestUnexportedReferenceFieldsAreValueSafe(t *testing.T) {
+	// A struct with only unexported reference fields should be treated
+	// as a value type (no deep copy needed) because encoding/json
+	// never writes to unexported fields.
+	type withPrivateSlice struct {
+		Name  string `json:"name"`
+		cache []byte // unexported: JSON won't touch this
+	}
+
+	if hasReferenceFields(reflect.TypeOf(withPrivateSlice{})) {
+		t.Fatal("expected false: only unexported reference fields")
+	}
+}
+
+func TestJsonDashTagSkipsField(t *testing.T) {
+	// A struct field with `json:"-"` should be ignored by hasReferenceFields.
+	type withIgnoredSlice struct {
+		Name string   `json:"name"`
+		Skip []string `json:"-"`
+	}
+
+	if hasReferenceFields(reflect.TypeOf(withIgnoredSlice{})) {
+		t.Fatal("expected false: json:\"-\" fields should be skipped")
+	}
+}
+
+func TestDeepCopyMap(t *testing.T) {
+	type withMap struct {
+		Data map[string]int `json:"data"`
+	}
+
+	dec := New()
+	data := []byte(`{"data":{"a":1,"b":2}}`)
+
+	var v1 withMap
+	if err := dec.Unmarshal(data, &v1); err != nil {
+		t.Fatal(err)
+	}
+	v1.Data["a"] = 999 // mutate caller's map
+
+	var v2 withMap
+	if err := dec.Unmarshal(data, &v2); err != nil {
+		t.Fatal(err)
+	}
+	if v2.Data["a"] != 1 || v2.Data["b"] != 2 {
+		t.Fatalf("cache was corrupted by map mutation: %v", v2.Data)
+	}
+}
+
+func TestDeepCopyPointerField(t *testing.T) {
+	type withPtr struct {
+		Name  string `json:"name"`
+		Count *int   `json:"count"`
+	}
+
+	dec := New()
+	data := []byte(`{"name":"x","count":42}`)
+
+	var v1 withPtr
+	if err := dec.Unmarshal(data, &v1); err != nil {
+		t.Fatal(err)
+	}
+	*v1.Count = 0 // mutate through pointer
+
+	var v2 withPtr
+	if err := dec.Unmarshal(data, &v2); err != nil {
+		t.Fatal(err)
+	}
+	if v2.Count == nil || *v2.Count != 42 {
+		t.Fatalf("cache was corrupted by pointer mutation: count=%v", v2.Count)
+	}
+}
+
+func TestDeepCopyInterface(t *testing.T) {
+	// Unmarshal into map[string]any to exercise the interface deep copy path.
+	dec := New()
+	data := []byte(`{"nested":{"a":1},"list":[1,2,3]}`)
+
+	var v1 map[string]any
+	if err := dec.Unmarshal(data, &v1); err != nil {
+		t.Fatal(err)
+	}
+	// Mutate the nested map.
+	nested := v1["nested"].(map[string]any)
+	nested["a"] = "CORRUPTED"
+
+	var v2 map[string]any
+	if err := dec.Unmarshal(data, &v2); err != nil {
+		t.Fatal(err)
+	}
+	nested2 := v2["nested"].(map[string]any)
+	if nested2["a"] != float64(1) {
+		t.Fatalf("cache was corrupted by interface/map mutation: %v", v2)
+	}
+}
+
+func TestHasLiveRefsNilFields(t *testing.T) {
+	// A struct with reference-typed fields that are all nil should
+	// use the shallow copy path (1 unmarshal, no deep copy).
+	type sparse struct {
+		Name  string   `json:"name"`
+		Tags  []string `json:"tags,omitempty"`
+		Extra *int     `json:"extra,omitempty"`
+	}
+
+	var calls atomic.Int64
+	dec := New(WithUnmarshalFunc(func(data []byte, v any) error {
+		calls.Add(1)
+		return json.Unmarshal(data, v)
+	}))
+
+	// JSON does not include tags or extra — they'll be nil.
+	data := []byte(`{"name":"sparse"}`)
+	var v sparse
+	_ = dec.Unmarshal(data, &v)
+	_ = dec.Unmarshal(data, &v) // hit
+
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("sparse ref-type struct: expected 1 unmarshal, got %d", got)
+	}
+	if v.Name != "sparse" || v.Tags != nil || v.Extra != nil {
+		t.Fatalf("unexpected value: %+v", v)
+	}
+}
+
 // Benchmarks: worst case (all misses) vs stdlib json.Unmarshal.
-// cachet will always be slower on pure misses due to the string(data)
-// conversion, reflect.TypeOf, and sync.Map overhead. These benchmarks
-// quantify exactly how much.
+// cachet will always be slower on pure misses due to reflect, deep copy,
+// and sync.Map overhead. These benchmarks quantify exactly how much.
 
 // smallPayload is a typical small JSON object.
 var smallPayload = []byte(`{"name":"alice","age":30}`)
