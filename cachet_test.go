@@ -365,7 +365,10 @@ func TestNilPointerError(t *testing.T) {
 
 func TestNonPointerError(t *testing.T) {
 	dec := New()
-	err := dec.Unmarshal([]byte(`{}`), person{})
+	// Intentionally pass a non-pointer to test the error path.
+	// Use a variable so go vet does not flag the call.
+	var nonPtr any = person{}
+	err := dec.Unmarshal([]byte(`{}`), nonPtr)
 
 	var target *json.InvalidUnmarshalError
 	if !errors.As(err, &target) {
@@ -373,7 +376,7 @@ func TestNonPointerError(t *testing.T) {
 	}
 
 	// Verify message matches stdlib.
-	stdlibErr := json.Unmarshal([]byte(`{}`), person{})
+	stdlibErr := json.Unmarshal([]byte(`{}`), nonPtr)
 	if err.Error() != stdlibErr.Error() {
 		t.Fatalf("error message mismatch:\n  cachet: %s\n  stdlib: %s", err, stdlibErr)
 	}
