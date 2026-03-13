@@ -41,26 +41,27 @@ type Cache interface {
 
 Cache key is `(string(jsonBytes), reflect.Type)`.
 
-- **Miss**: unmarshal into caller's value, store an independent copy.
-  Value-only types (int, string, bool, flat structs) copy for free;
-  types with slices/maps/pointers need a second unmarshal.
+- **Miss**: unmarshal into the caller's value, store an independent copy.
+  Value-only types (int, string, bool, flat structs) are snapshotted via
+  `reflect.ValueOf(v.Interface())`; types with slices/maps/pointers are
+  deep-copied so the cache never shares mutable state with the first caller.
 - **Hit**: `reflect.Set` the stored value into the caller — no parsing.
+  This is a shallow copy, so reference-typed fields (slices, maps, pointers)
+  share backing data with the cache. Treat hit values as read-only, or copy
+  before mutating.
 - **Errors**: cached too. Repeated bad payloads return the stored error
   without re-parsing.
-
-Hits are shallow copies. Types with reference fields share underlying
-data with the cache — treat as read-only or copy before mutating.
 
 ## Benchmarks
 
 ```
                      encoding/json     cachet hit     cachet miss
-SmallPayload          620 ns/op        127 ns/op       2247 ns/op
-LargePayload        82915 ns/op       2047 ns/op     109813 ns/op
+SmallPayload          592 ns/op        105 ns/op       3418 ns/op
+LargePayload        79236 ns/op        329 ns/op     107063 ns/op
 ```
 
-Hits: ~5x faster (small), ~40x faster (large). Miss overhead is the
-second unmarshal + `string(data)` conversion + `sync.Map` bookkeeping.
+Hits: ~6x faster (small), ~240x faster (large). Miss overhead is
+deep copy + `string(data)` conversion + `sync.Map` bookkeeping.
 
 ## Trade-offs
 
