@@ -56,43 +56,27 @@ Cache key is `(string(jsonBytes), reflect.Type)`.
 
 ```
                      encoding/json     cachet hit     cachet miss
-SmallPayload          592 ns/op        105 ns/op       3418 ns/op
-LargePayload        79236 ns/op        329 ns/op     107063 ns/op
+SmallPayload          716 ns/op        122 ns/op       2764 ns/op
+LargePayload        92600 ns/op        352 ns/op     118304 ns/op
 ```
 
-Hits: ~6x faster (small), ~240x faster (large). Miss overhead is
-deep copy + `string(data)` conversion + `sync.Map` bookkeeping.
+Hits: ~6x faster (small), ~260x faster (large).
+Misses: ~4x slower (small), ~1.3x slower (large). The small-payload
+miss is dominated by `sync.Map` and key allocation overhead relative
+to a fast unmarshal; for large payloads the deep copy cost is dwarfed
+by the parse itself.
 
 ## Trade-offs
 
 The default `sync.Map` grows without bound. For many-unique-payload
 workloads, plug in an LRU via `WithCache`.
 
-## Alternatives to consider
+## Alternatives
 
-Depending on your workload, cachet may be overkill or the wrong tool:
-
-- **`sync.Once` / lazy init** — if you unmarshal a payload once at startup
-  and reuse the value, you don't need a cache library. A `sync.Once` or
-  package-level `var` is simpler and has zero overhead.
-
-- **[goccy/go-json](https://github.com/goccy/go-json)** — ~2x faster than
-  `encoding/json` for typical structs, no caching layer needed. If your
-  bottleneck is parsing speed rather than repeated payloads, a faster
-  decoder gives you most of the win with none of the complexity.
-  cachet can also wrap it via `WithUnmarshalFunc(gojson.Unmarshal)` for
-  both benefits.
-
-- **[kofalt/go-memoize](https://github.com/kofalt/go-memoize)** — generic
-  function memoizer with TTL and purge. If you want to cache the result
-  of *any* expensive function (not just JSON), this is more general.
-  cachet is narrower on purpose: it knows about `reflect.Type` keys and
-  shallow-copy semantics so you don't have to.
-
-- **[shogo82148/memoize](https://github.com/shogo82148/memoize)** —
-  `singleflight` + caching with generics. Good if you also need
-  deduplication of in-flight calls (e.g. many goroutines requesting
-  the same key concurrently).
+- **`sync.Once`** — if you only unmarshal once at startup, a `sync.Once` is simpler.
+- **[goccy/go-json](https://github.com/goccy/go-json)** — faster decoder (~2x); use via `WithUnmarshalFunc` if you want both.
+- **[kofalt/go-memoize](https://github.com/kofalt/go-memoize)** — generic function memoizer with TTL.
+- **[shogo82148/memoize](https://github.com/shogo82148/memoize)** — `singleflight` + caching with generics.
 
 ## License
 
